@@ -62,7 +62,7 @@ Requirements: Android NDK r27+, Android SDK build-tools (aapt2, d8, zipalign, ap
 
 ## Install
 
-Zygisk must be enabled in the Magisk app.
+Download `pico_hand_fusion.zip` and `companion.apk` from the [Releases](https://github.com/ImRyuma/pico-hand-fusion/releases) page (pre-releases, not stable yet), or build them yourself (see above). Zygisk must be enabled in the Magisk app.
 
 ```bash
 adb push out/pico_hand_fusion.zip /data/local/tmp/
