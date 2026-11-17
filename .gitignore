@@ -1,0 +1,11 @@
+# Build output
+out/
+
+# Local APK signing key
+companion/debug.keystore
+
+# Recordings (may contain motion data)
+*.csv
+
+# Python
+__pycache__/
