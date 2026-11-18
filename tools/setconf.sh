@@ -15,7 +15,7 @@ for kv in "$@"; do
   adb shell "su -c '
     set -e
     owner=\$(stat -c %u:%g /data/data/com.picovr.picostreamassistant)
-    touch $CONF
+    [ -f $CONF ] || touch $CONF
     grep -v \"^$key=\" $CONF > $CONF.tmp || true
     echo \"$kv\" >> $CONF.tmp
     chown \$owner $CONF.tmp; chmod 0600 $CONF.tmp
