@@ -19,7 +19,8 @@ public:
     void captureInput(int hand, XrTime time, const XrHandJointLocationsEXT* locs, bool haveTracker, uint64_t trackerId,
                       bool trackerValid, const XrPosef& tracker, uint32_t trackerFlags);
     // Output after fusion, for the same hand and frame.
-    void captureOutput(int hand, const XrHandJointLocationsEXT* locs, int mode);
+    void captureOutput(int hand, const XrHandJointLocationsEXT* locs, int mode, float shapeDelta, float viewAz,
+                       float viewEl);
 
     // Writes the CSV when the time is up. Returns true when a file was written.
     bool finishIfDue(int64_t nowNs, const std::string& dir);
@@ -39,6 +40,9 @@ private:
         float trk[7];
         float out[7];
         float tip[3];   // index tip, output
+        float camTip[3];  // index tip in the camera palm frame, before fusion
+        float shapeDelta; // largest finger joint move in the palm frame since the previous fresh camera frame
+        float viewAz, viewEl;  // hand direction from the headset (deg)
     };
 
     bool recording_ = false;

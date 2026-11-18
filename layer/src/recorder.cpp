@@ -3,6 +3,7 @@
 #include <cstdio>
 
 #include "log.h"
+#include "xr_math.h"
 
 namespace hf {
 
@@ -48,6 +49,12 @@ void Recorder::captureInput(int hand, XrTime time, const XrHandJointLocationsEXT
     r.palm[0] = palm.x;
     r.palm[1] = palm.y;
     r.palm[2] = palm.z;
+    const XrVector3f tipLocal = pmul(pinv(locs->jointLocations[XR_HAND_JOINT_PALM_EXT].pose),
+                                     locs->jointLocations[XR_HAND_JOINT_INDEX_TIP_EXT].pose)
+                                    .position;
+    r.camTip[0] = tipLocal.x;
+    r.camTip[1] = tipLocal.y;
+    r.camTip[2] = tipLocal.z;
     r.trackerId = haveTracker ? (int64_t)trackerId : -1;
     r.trackerValid = trackerValid ? 1 : 0;
     r.trackerFlags = trackerFlags;
@@ -56,10 +63,14 @@ void Recorder::captureInput(int hand, XrTime time, const XrHandJointLocationsEXT
     rows_.push_back(r);
 }
 
-void Recorder::captureOutput(int hand, const XrHandJointLocationsEXT* locs, int mode) {
+void Recorder::captureOutput(int hand, const XrHandJointLocationsEXT* locs, int mode, float shapeDelta, float viewAz,
+                             float viewEl) {
     if (!recording_ || rows_.empty() || rows_.back().hand != hand || !locs || !locs->jointLocations) return;
     Row& r = rows_.back();
     r.mode = (int8_t)mode;
+    r.shapeDelta = shapeDelta;
+    r.viewAz = viewAz;
+    r.viewEl = viewEl;
     putPose(r.out, locs->jointLocations[XR_HAND_JOINT_WRIST_EXT].pose);
     const XrVector3f& tip = locs->jointLocations[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position;
     r.tip[0] = tip.x;
@@ -79,7 +90,8 @@ bool Recorder::finishIfDue(int64_t nowNs, const std::string& dir) {
     fputs("time_ns,hand,active,wrist_flags,mode,tracker_id,tracker_valid,tracker_flags,"
           "cam_px,cam_py,cam_pz,cam_qx,cam_qy,cam_qz,cam_qw,palm_x,palm_y,palm_z,"
           "trk_px,trk_py,trk_pz,trk_qx,trk_qy,trk_qz,trk_qw,"
-          "out_px,out_py,out_pz,out_qx,out_qy,out_qz,out_qw,tip_x,tip_y,tip_z\n",
+          "out_px,out_py,out_pz,out_qx,out_qy,out_qz,out_qw,tip_x,tip_y,tip_z,"
+          "cam_tip_x,cam_tip_y,cam_tip_z,shape_delta_mm,view_az_deg,view_el_deg\n",
           f);
     for (const Row& r : rows_) {
         fprintf(f, "%lld,%d,%d,%u,%d,%lld,%d,%u", (long long)r.time, r.hand, r.active, r.wristFlags, r.mode,
@@ -89,6 +101,8 @@ bool Recorder::finishIfDue(int64_t nowNs, const std::string& dir) {
         for (float v : r.trk) fprintf(f, ",%.5f", v);
         for (float v : r.out) fprintf(f, ",%.5f", v);
         for (float v : r.tip) fprintf(f, ",%.5f", v);
+        for (float v : r.camTip) fprintf(f, ",%.5f", v);
+        fprintf(f, ",%.3f,%.1f,%.1f", r.shapeDelta * 1000.f, r.viewAz, r.viewEl);
         fputc('\n', f);
     }
     fclose(f);

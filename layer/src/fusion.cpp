@@ -30,6 +30,11 @@ constexpr float kRelearnErr = 0.08f;       // m, lasting average disagreement th
 constexpr int kRelearnFrames = 450;        // ~5 s
 
 constexpr int kFrozenFrames = 8;                  // identical camera palm positions in a row (~90 ms)
+// Out of the cameras' view the runtime may keep moving the last skeleton seen as one rigid block, flagged
+// as tracked. Real camera frames always reshape the fingers a little.
+constexpr float kRigidShapeEps = 0.00003f;  // m, largest finger joint move in the palm frame between fresh frames
+constexpr float kRigidMinPalmMove = 0.001f; // m, palm move needed for the frame to count (else it is just still)
+constexpr int kRigidFrames = 3;             // rigid fresh frames in a row before the camera is distrusted
 constexpr float kJumpDist = 0.08f;               // m in one frame (> 7 m/s): the runtime re-snapped the tracker
 constexpr int64_t kJumpDistrustNs = 300000000LL;  // tracker position ignored this long after a jump
 constexpr float kDeadReckonTau = 0.15f;          // s, how fast a hidden tracker is pulled toward the camera
@@ -42,6 +47,18 @@ constexpr float kRadToDeg = 57.2957795f;
 constexpr float kDefaultDt = 1.f / 90.f;
 constexpr int64_t kFilterResetNs = 500000000LL;
 
+// Camera latency measurement: during moves, the lag that best lines the camera palm up with the
+// tracker-predicted palm (smallest residual spread) is the camera latency.
+constexpr float kLagMinSpeed = 0.25f;           // m/s, slower frames carry no timing information
+constexpr int64_t kLagMaxGapNs = 150000000LL;   // a longer gap between samples restarts the window
+constexpr int kLagMaxMs = 150;
+constexpr int kLagStepMs = 5;
+constexpr float kLagMaxRms = 0.03f;             // m, residual spread above this: window rejected
+constexpr float kLagMinContrast = 0.6f;         // best spread must be below this fraction of the worst (flat curve: no information)
+constexpr float kLagRate = 0.15f;               // smoothing of the estimate across windows
+// Average finger shape (relaxed pose used out of view): ~5 s time constant on fresh frames.
+constexpr float kMeanShapeRate = 0.005f;
+
 XrHandJointVelocitiesEXT* findVelocities(XrHandJointLocationsEXT* locs) {
     auto* p = reinterpret_cast<XrBaseOutStructure*>(locs->next);
     while (p) {
@@ -49,6 +66,17 @@ XrHandJointVelocitiesEXT* findVelocities(XrHandJointLocationsEXT* locs) {
         p = p->next;
     }
     return nullptr;
+}
+
+// True when `p` is outside the hand tracking cameras' field of view (headset pose `view`, OpenXR
+// view axes: -Z forward, +X right, +Y up). Also fills the direction angles.
+bool outsideFov(const XrPosef& view, const XrVector3f& p, const Config& cfg, float* az, float* el) {
+    const XrVector3f l = pmul(pinv(view), XrPosef{qidentity(), p}).position;
+    const float fwd = -l.z;
+    *az = std::atan2(l.x, fwd) * 57.2957795f;
+    *el = std::atan2(l.y, fwd) * 57.2957795f;
+    if (fwd < 0.05f) return true;  // beside or behind the head
+    return std::fabs(*az) > cfg.fovSideDeg || *el > cfg.fovUpDeg || *el < -cfg.fovDownDeg;
 }
 
 bool isManual(int hand, const Config& cfg) { return (hand == 0 ? cfg.leftTracker : cfg.rightTracker) >= 0; }
@@ -124,6 +152,68 @@ void Fusion::seedOffset(int hand, const XrPosef& offset) {
     if (hand < 0 || hand > 1) return;
     hands_[hand].seed = offset;
     hands_[hand].haveSeed = true;
+}
+
+void Fusion::seedCameraLag(float ms) {
+    if (ms > 0.f && ms <= (float)kLagMaxMs) lagEstMs_ = ms;
+}
+
+int64_t Fusion::lagNs(const Config& cfg) const {
+    const float ms = (cfg.cameraLagAuto && lagEstMs_ > 0.f) ? lagEstMs_ : (float)cfg.cameraLagMs;
+    return (int64_t)(ms * 1e6f);
+}
+
+void Fusion::measureLag(Hand& h, XrTime time, const XrVector3f& camPalm) {
+    if (h.speed < kLagMinSpeed || (h.lagCount > 0 && time - h.lagTime[h.lagCount - 1] > kLagMaxGapNs)) {
+        h.lagCount = 0;
+        if (h.speed < kLagMinSpeed) return;
+    }
+    h.lagTime[h.lagCount] = time;
+    h.lagCam[h.lagCount] = camPalm;
+    if (++h.lagCount < kLagWindow) return;
+    h.lagCount = 0;
+
+    // The whole window must be covered by the tracker history, even at the largest lag.
+    const int oldest = (h.histHead - h.histCount + kHistory) % kHistory;
+    if (h.histCount < kHistory / 2 || h.lagTime[0] - (int64_t)kLagMaxMs * 1000000LL < h.histTime[oldest]) return;
+
+    constexpr int kSteps = kLagMaxMs / kLagStepMs + 1;
+    float spread[kSteps];
+    int best = 0;
+    float worst = 0.f;
+    for (int k = 0; k < kSteps; k++) {
+        const int64_t lag = (int64_t)k * kLagStepMs * 1000000LL;
+        XrVector3f r[kLagWindow];
+        XrVector3f mean = v3(0.f, 0.f, 0.f);
+        for (int i = 0; i < kLagWindow; i++) {
+            r[i] = sub(h.lagCam[i], pmul(trackerAt(h, h.lagTime[i] - lag), h.offset).position);
+            mean = add(mean, r[i]);
+        }
+        mean = scale(mean, 1.f / kLagWindow);
+        float var = 0.f;
+        for (int i = 0; i < kLagWindow; i++) {
+            const XrVector3f d = sub(r[i], mean);
+            var += dot(d, d);
+        }
+        spread[k] = var / kLagWindow;
+        if (spread[k] < spread[best]) best = k;
+        worst = std::fmax(worst, spread[k]);
+    }
+    // A minimum on the edge of the range, a flat curve or a large residual is not a measurement.
+    if (best == 0 || best == kSteps - 1 || spread[best] > kLagMinContrast * worst ||
+        std::sqrt(spread[best]) > kLagMaxRms)
+        return;
+    // Parabola through the three points around the minimum for a sub-step estimate.
+    const float a = spread[best - 1], b = spread[best], c = spread[best + 1];
+    const float den = a - 2.f * b + c;
+    const float frac = den > 0.f ? 0.5f * (a - c) / den : 0.f;
+    const float ms = ((float)best + std::fmax(-0.5f, std::fmin(0.5f, frac))) * kLagStepMs;
+    lagEstMs_ = lagEstMs_ < 0.f ? ms : lagEstMs_ + kLagRate * (ms - lagEstMs_);
+    lagUpdates_++;
+    lagRmsMm_ = std::sqrt(spread[best]) * 1000.f;
+    if (lagUpdates_ <= 3 || lagUpdates_ % 20 == 0)
+        HF_LOGI("fusion: camera latency %.0f ms (window %.0f ms, residual %.0f mm, %d windows)", lagEstMs_, ms,
+                lagRmsMm_, lagUpdates_);
 }
 
 bool Fusion::learnedOffset(int hand, XrPosef* out) const {
@@ -268,7 +358,7 @@ void Fusion::learn(Hand& h, XrTime time, const XrPosef& lagged, const XrPosef& p
 }
 
 void Fusion::process(int hand, XrTime time, const TrackerSample* trackers, int trackerCount,
-                     XrHandJointLocationsEXT* locs, const Config& cfg) {
+                     XrHandJointLocationsEXT* locs, const Config& cfg, const XrPosef* view) {
     if (hand < 0 || hand > 1 || !locs || !locs->jointLocations || locs->jointCount < (uint32_t)kJointCount) return;
     Hand& h = hands_[hand];
     XrHandJointLocationEXT* j = locs->jointLocations;
@@ -282,16 +372,50 @@ void Fusion::process(int hand, XrTime time, const TrackerSample* trackers, int t
     const bool cameraFrozen = h.camRepeat >= kFrozenFrames;
     if (cameraFrozen) h.cameraFrozenFrames++;
     const bool cameraFresh = h.camRepeat == 0;
-    const bool cameraTracked =
-        locs->isActive && (j[XR_HAND_JOINT_PALM_EXT].locationFlags & kAll) == kAll && !cameraFrozen;
+    if (cameraFresh && locs->isActive) {
+        const XrPosef invCam = pinv(camPalm);
+        float maxMove = 0.f;
+        XrVector3f local[kJointCount];
+        for (int i = 0; i < kJointCount; i++) {
+            local[i] = pmul(invCam, j[i].pose).position;
+            if (h.havePrevLocal) maxMove = std::fmax(maxMove, length(sub(local[i], h.prevLocal[i])));
+            h.prevLocal[i] = local[i];
+        }
+        const float palmMove = length(sub(camPalm.position, h.prevCamPalm));
+        h.prevCamPalm = camPalm.position;
+        if (h.havePrevLocal) {
+            h.shapeDelta = maxMove;
+            if (maxMove < kRigidShapeEps && palmMove > kRigidMinPalmMove) h.rigidRepeat++;
+            else if (maxMove >= kRigidShapeEps) h.rigidRepeat = 0;
+        }
+        h.havePrevLocal = true;
+    } else if (!locs->isActive) {
+        h.havePrevLocal = false;
+        h.rigidRepeat = 0;
+    }
+    const bool cameraExtrapolated = h.rigidRepeat >= kRigidFrames;
+    if (cameraExtrapolated) h.cameraExtrapolatedFrames++;
+    const bool cameraReported = locs->isActive && (j[XR_HAND_JOINT_PALM_EXT].locationFlags & kAll) == kAll &&
+                                !cameraFrozen && !cameraExtrapolated;
 
     // ---- tracker
-    if (cameraTracked) assign(hand, camPalm.position, trackers, trackerCount, cfg);
+    if (cameraReported) assign(hand, camPalm.position, trackers, trackerCount, cfg);
     const TrackerSample* t = find(h.assigned, trackers, trackerCount);
     const bool trackerOk = t && t->valid;
     if (trackerOk) pushTracker(h, time, t->pose);
+
+    // Where is the hand really? The tracker knows even when the cameras cannot see it. Outside the
+    // cameras' field of view, the runtime keeps reporting a stale hand as tracked: ignore it.
+    bool outOfView = false;
+    if (view) {
+        const bool calibrated = trackerOk && h.samples >= cfg.minSamples;
+        const XrVector3f where = calibrated ? pmul(t->pose, h.offset).position : camPalm.position;
+        outOfView = outsideFov(*view, where, cfg, &h.viewAz, &h.viewEl) && cfg.fovCheck && calibrated;
+        if (outOfView) h.outOfViewFrames++;
+    }
+    const bool cameraTracked = cameraReported && !outOfView;
     if (h.seeded && h.learnedAt == 0) h.learnedAt = time;
-    const XrPosef lagged = trackerOk ? trackerAt(h, time - cfg.cameraLagMs * 1000000LL) : pidentity();
+    const XrPosef lagged = trackerOk ? trackerAt(h, time - lagNs(cfg)) : pidentity();
 
     // The tracker sits on the back of the hand: with the palm facing the headset it is hidden from
     // the headset cameras and the runtime only dead-reckons its position (orientation stays good).
@@ -316,6 +440,8 @@ void Fusion::process(int hand, XrTime time, const TrackerSample* trackers, int t
     // Learn only from fresh camera frames: a repeated one pairs an old camera pose with a new tracker pose.
     if (cameraTracked && cameraFresh && trackerOptical) learn(h, time, lagged, camPalm, cfg);
     const bool offsetReady = trackerOk && h.samples >= cfg.minSamples;
+    if (cfg.cameraLagAuto && offsetReady && !h.relearning && cameraTracked && cameraFresh && trackerOptical)
+        measureLag(h, time, camPalm.position);
 
     // ---- is this camera frame usable? (the runtime keeps reporting "tracked" while it extrapolates)
     bool cameraGood = cameraTracked;
@@ -338,7 +464,11 @@ void Fusion::process(int hand, XrTime time, const TrackerSample* trackers, int t
     // ---- finger shape in the palm frame
     if (cameraGood) {
         const XrPosef invPalm = pinv(camPalm);
-        if (!h.wasGood) h.reacquireStart = time;
+        if (!h.wasGood) {
+            // Blend from what was shown (last pose seen, possibly relaxed) to the cameras.
+            h.reacquireStart = time;
+            for (int i = 0; i < kJointCount; i++) h.frozen[i] = h.shape[i];
+        }
         const float span = (float)cfg.reacquireMs * 1e6f;
         float b = (h.haveShape && span > 0.f) ? (float)(time - h.reacquireStart) / span : 1.f;
         if (b < 0.f) b = 0.f;
@@ -346,11 +476,23 @@ void Fusion::process(int hand, XrTime time, const TrackerSample* trackers, int t
             const XrPosef s = pmul(invPalm, j[i].pose);
             h.shape[i] = b >= 1.f ? s : pblend(h.frozen[i], s, b);
             h.radius[i] = j[i].radius;
+            if (cameraFresh) h.meanShape[i] = h.haveMean ? pblend(h.meanShape[i], s, kMeanShapeRate) : s;
         }
+        if (cameraFresh) h.haveMean = true;
         h.haveShape = true;
         h.lastGood = time;
-    } else if (h.wasGood) {
-        for (int i = 0; i < kJointCount; i++) h.frozen[i] = h.shape[i];
+    } else if (h.haveShape) {
+        if (h.wasGood)
+            for (int i = 0; i < kJointCount; i++) h.lostShape[i] = h.shape[i];
+        // Out of view: rather than keeping the fingers frozen in the last pose seen (often mid-gesture),
+        // relax them toward this hand's average pose.
+        const int64_t since = time - h.lastGood - cfg.fingerRelaxDelayMs * 1000000LL;
+        if (h.haveMean && cfg.fingerRelaxMs > 0 && since > 0) {
+            float b = (float)since / ((float)cfg.fingerRelaxMs * 1e6f);
+            if (b > 1.f) b = 1.f;
+            b = b * b * (3.f - 2.f * b);  // smoothstep: no sudden start or stop
+            for (int i = 0; i < kJointCount; i++) h.shape[i] = pblend(h.lostShape[i], h.meanShape[i], b);
+        }
     }
     h.wasGood = cameraGood;
 
@@ -463,14 +605,18 @@ std::string Fusion::status() const {
                  "%s.mode=%s\n%s.tracker=%lld\n%s.samples=%d\n%s.err_mm=%.0f\n%s.err_deg=%.1f\n%s.err_avg_mm=%.0f\n"
                  "%s.speed_cms=%.0f\n%s.frames_fused=%llu\n%s.frames_tracker_only=%llu\n%s.camera_outliers=%llu\n"
                  "%s.relearns=%d\n%s.frames_imu_camera=%llu\n%s.tracker_hidden=%llu\n%s.tracker_jumps=%llu\n"
-                 "%s.camera_frozen=%llu\n",
+                 "%s.camera_frozen=%llu\n%s.camera_extrapolated=%llu\n%s.out_of_view=%llu\n",
                  n, modeName(h.mode), n, (long long)h.assigned, n, h.samples, n, h.lastErrPos * 1000.f, n,
                  h.lastErrAngle, n, h.errAvg * 1000.f, n, h.speed * 100.f, n, (unsigned long long)h.framesFused, n,
                  (unsigned long long)h.framesTrackerOnly, n, (unsigned long long)h.outliers, n, h.relearns, n,
                  (unsigned long long)h.framesImu, n, (unsigned long long)h.trackerHidden, n,
-                 (unsigned long long)h.jumps, n, (unsigned long long)h.cameraFrozenFrames);
+                 (unsigned long long)h.jumps, n, (unsigned long long)h.cameraFrozenFrames, n,
+                 (unsigned long long)h.cameraExtrapolatedFrames, n, (unsigned long long)h.outOfViewFrames);
         s += buf;
     }
+    snprintf(buf, sizeof(buf), "camera_lag_ms=%.0f\ncamera_lag_windows=%d\ncamera_lag_residual_mm=%.0f\n",
+             lagEstMs_, lagUpdates_, lagRmsMm_);
+    s += buf;
     return s;
 }
 

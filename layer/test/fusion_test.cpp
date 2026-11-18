@@ -165,7 +165,126 @@ int main() {
     const bool ok3 = maxErrHidden < 0.02f && maxStep < 0.005f;
     printf("hidden scenario: %s\n", ok3 ? "PASS" : "FAIL");
 
-    const bool ok = ok1 && ok2 && ok3;
+    // Scenario 4: camera latency measured during the moving scenario (camera delayed by 5 frames = 55.6 ms).
+    const size_t pl = st.find("camera_lag_ms=");
+    const float lagMs = pl == std::string::npos ? -1.f : (float)atof(st.c_str() + pl + 14);
+    const size_t pw = st.find("camera_lag_windows=");
+    const long windows = pw == std::string::npos ? 0 : atol(st.c_str() + pw + 19);
+    const bool ok4 = std::fabs(lagMs - 55.6f) < 12.f && windows > 0;
+    printf("camera latency measured: %.0f ms over %ld windows (truth 56 ms): %s\n", lagMs, windows,
+           ok4 ? "PASS" : "FAIL");
+
+    // Scenario 5: fingers mostly straight, curled for the last second, then the hand leaves the cameras'
+    // view. The fingers should relax from the curled pose toward the usual (straight) one.
+    Fusion f5;
+    t = 1000000000LL;
+    float tipCurled = 0.f, tipAfter = 0.f, tipStraight = 0.f;
+    for (int frame = 0; frame < 1200; frame++, t += dt) {
+        const bool cameraSees = frame < 900;
+        const bool curled = frame >= 860;
+        for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++) {
+            const XrVector3f local = curled ? v3(0.f, -0.004f * (float)i, -0.004f * (float)i) : v3(0.f, 0.f, -0.01f * (float)i);
+            joints[i].pose = pmul(wrist, XrPosef{qidentity(), local});
+            joints[i].pose.position = add(joints[i].pose.position, v3(noise(jitter), noise(jitter), noise(jitter)));
+            joints[i].radius = 0.01f;
+            joints[i].locationFlags = cameraSees ? 0xF : 0;
+        }
+        locs.isActive = cameraSees ? XR_TRUE : XR_FALSE;
+        TrackerSample tr;
+        tr.id = 1;
+        tr.valid = true;
+        tr.pose = trackerPose;
+        f5.process(1, t, &tr, 1, &locs, cfg);
+        const XrVector3f tip = sub(joints[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position, joints[XR_HAND_JOINT_PALM_EXT].pose.position);
+        const XrVector3f straight = v3(0.f, 0.f, -0.01f * (XR_HAND_JOINT_INDEX_TIP_EXT - XR_HAND_JOINT_PALM_EXT));
+        if (frame == 899) tipCurled = length(sub(tip, straight));
+        if (frame == 1199) {
+            tipAfter = length(sub(tip, straight));
+            tipStraight = tipAfter;
+        }
+    }
+    const bool ok5 = tipCurled > 0.02f && tipAfter < tipCurled * 0.4f;
+    printf("fingers out of view: index tip %.0f mm from the usual pose when lost, %.0f mm after 3 s: %s\n",
+           1000.f * tipCurled, 1000.f * tipStraight, ok5 ? "PASS" : "FAIL");
+
+    // Scenario 6: the hand leaves the cameras' view holding a fist, but the runtime keeps sending the last
+    // open hand it saw, moved as one rigid block and flagged as tracked. It must not be taken as camera data.
+    Fusion f6;
+    t = 1000000000LL;
+    XrPosef last[XR_HAND_JOINT_COUNT_EXT];
+    long extrapolated = 0;
+    float tipEnd = 0.f;
+    for (int frame = 0; frame < 1100; frame++, t += dt) {
+        const bool seen = frame < 800;
+        if (seen) {
+            for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++) {
+                joints[i].pose = pmul(wrist, XrPosef{qidentity(), v3(0.f, 0.f, -0.01f * (float)i)});
+                joints[i].pose.position = add(joints[i].pose.position, v3(noise(jitter), noise(jitter), noise(jitter)));
+                last[i] = joints[i].pose;
+            }
+        } else {
+            for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++) {
+                joints[i].pose = last[i];
+                joints[i].pose.position = add(last[i].position, v3(0.003f * (frame - 800), 0.f, 0.f));
+            }
+        }
+        for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++) {
+            joints[i].radius = 0.01f;
+            joints[i].locationFlags = 0xF;
+        }
+        locs.isActive = XR_TRUE;
+        TrackerSample tr;
+        tr.id = 1;
+        tr.valid = true;
+        tr.positionTracked = seen;
+        tr.pose = trackerPose;
+        f6.process(1, t, &tr, 1, &locs, cfg);
+        (void)tipEnd;
+    }
+    const std::string st6 = f6.status();
+    const size_t pe = st6.find("right.camera_extrapolated=");
+    extrapolated = pe == std::string::npos ? 0 : atol(st6.c_str() + pe + 26);
+    const bool ok6 = extrapolated > 250;
+    printf("rigid extrapolation detected on %ld / 300 frames: %s\n", extrapolated, ok6 ? "PASS" : "FAIL");
+
+    // Scenario 7: headset at the origin looking down -Z. The hand is calibrated in front of it, then the
+    // tracker goes to the side (out of the cameras' view) while the runtime keeps sending a noisy open hand
+    // in front. That camera data must be ignored: the hand follows its tracker and the fingers relax.
+    Fusion f7;
+    t = 1000000000LL;
+    XrPosef head = pidentity();
+    head.position = v3(0.2f, 1.5f, 0.f);
+    const XrPosef side = XrPosef{qidentity(), v3(0.9f, 1.1f, 0.0f)};  // 90 deg to the right of the head
+    float sideErr = 0.f;
+    for (int frame = 0; frame < 1100; frame++, t += dt) {
+        const bool away = frame >= 800;
+        const XrPosef truth = away ? side : wrist;
+        const bool curled = frame >= 760 && frame < 800;
+        for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++) {
+            const XrVector3f local = curled ? v3(0.f, -0.004f * (float)i, -0.004f * (float)i) : v3(0.f, 0.f, -0.01f * (float)i);
+            joints[i].pose = pmul(away ? wrist : truth, XrPosef{qidentity(), away ? v3(0.f, 0.f, -0.01f * (float)i) : local});
+            joints[i].pose.position = add(joints[i].pose.position, v3(noise(jitter), noise(jitter), noise(jitter)));
+            joints[i].radius = 0.01f;
+            joints[i].locationFlags = 0xF;
+        }
+        locs.isActive = XR_TRUE;
+        TrackerSample tr;
+        tr.id = 1;
+        tr.valid = true;
+        tr.positionTracked = true;
+        tr.pose = pmul(truth, pinv(trackerToWrist));
+        f7.process(1, t, &tr, 1, &locs, cfg, &head);
+        if (frame == 1099) sideErr = length(sub(joints[XR_HAND_JOINT_WRIST_EXT].pose.position,
+                                                add(side.position, v3(0.f, 0.f, -0.01f * XR_HAND_JOINT_WRIST_EXT))));
+    }
+    const std::string st7 = f7.status();
+    const size_t po = st7.find("right.out_of_view=");
+    const long outView = po == std::string::npos ? 0 : atol(st7.c_str() + po + 18);
+    const bool ok7 = outView >= 290 && sideErr < 0.02f;
+    printf("out of the cameras' view: %ld / 300 frames ignored, hand %.0f mm from its tracker position: %s\n",
+           outView, 1000.f * sideErr, ok7 ? "PASS" : "FAIL");
+
+    const bool ok = ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7;
     printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

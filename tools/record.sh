@@ -14,7 +14,7 @@ CONF=$DIR/hand_fusion.conf
 adb shell "su -c '
   set -e
   owner=\$(stat -c %u:%g /data/data/com.picovr.picostreamassistant)
-  touch $CONF
+  [ -f $CONF ] || touch $CONF
   epoch=\$(sed -n \"s/^record_epoch=//p\" $CONF | tail -n 1)
   epoch=\$(( \${epoch:-0} + 1 ))
   grep -v -E \"^(record_epoch|record_seconds)=\" $CONF > $CONF.tmp || true

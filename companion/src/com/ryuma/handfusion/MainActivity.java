@@ -17,12 +17,14 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Settings and live status for the Hand Fusion OpenXR layer running inside PICO Connect. */
+/** Settings and live status for the Hand Fusion layer running inside PICO Connect. */
 public final class MainActivity extends Activity {
     private static final String HOST = "com.picovr.picostreamassistant";
     private static final String DIR = "/data/data/" + HOST + "/files";
@@ -31,19 +33,35 @@ public final class MainActivity extends Activity {
 
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final Handler ui = new Handler(Looper.getMainLooper());
+    /** Last config read from or written to the file; only touched on the io thread. */
     private final Map<String, String> conf = new LinkedHashMap<>();
 
     private CheckBox enabled;
     private CheckBox fullFrequency;
+    private CheckBox lagAuto;
     private SeekBar weight;
     private TextView weightLabel;
     private SeekBar smoothing;
     private TextView smoothingLabel;
-    private EditText hold;
     private EditText leftTracker;
     private EditText rightTracker;
+    private final List<NumberSetting> numbers = new ArrayList<>();
     private TextView status;
     private boolean visible;
+
+    /** A numeric key of hand_fusion.conf edited in a text field. */
+    private static final class NumberSetting {
+        final String key;
+        final String def;
+        final boolean decimal;
+        EditText field;
+
+        NumberSetting(String key, String def, boolean decimal) {
+            this.key = key;
+            this.def = def;
+            this.decimal = decimal;
+        }
+    }
 
     private final Runnable refresh = new Runnable() {
         @Override
@@ -109,57 +127,49 @@ public final class MainActivity extends Activity {
 
         weightLabel = new TextView(this);
         root.addView(weightLabel);
-        weight = new SeekBar(this);
-        weight.setMax(100);
-        weight.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override
-            public void onProgressChanged(SeekBar s, int v, boolean fromUser) {
-                weightLabel.setText("Tracker weight when the cameras see the hand: " + v + " %");
-            }
-
-            @Override
-            public void onStartTrackingTouch(SeekBar s) {}
-
-            @Override
-            public void onStopTrackingTouch(SeekBar s) {}
-        });
-        root.addView(weight);
+        weight = slider(root, this::showWeight);
 
         smoothingLabel = new TextView(this);
         root.addView(smoothingLabel);
-        smoothing = new SeekBar(this);
-        smoothing.setMax(100);
-        smoothing.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override
-            public void onProgressChanged(SeekBar s, int v, boolean fromUser) {
-                smoothingLabel.setText("Tremor smoothing strength: " + v + " %");
-            }
+        smoothing = slider(root, this::showSmoothing);
 
-            @Override
-            public void onStartTrackingTouch(SeekBar s) {}
+        number(root, "hold_timeout_ms", "0", false, "Keep a hand lost by the cameras for (ms, 0 = forever)");
+        leftTracker = field(root, "Left tracker id (empty = automatic)", false);
+        rightTracker = field(root, "Right tracker id (empty = automatic)", false);
 
-            @Override
-            public void onStopTrackingTouch(SeekBar s) {}
-        });
-        root.addView(smoothing);
+        section(root, "Fingers out of view");
+        number(root, "finger_relax_delay_ms", "300", false, "Relax the fingers after (ms)");
+        number(root, "finger_relax_ms", "1500", false,
+                "Relaxing time toward the usual pose (ms, 0 = keep the last pose)");
+        number(root, "reacquire_ms", "150", false, "Blend back to the cameras over (ms)");
 
-        hold = numberField(root, "Keep a hand lost by the cameras for (ms, 0 = forever)");
-        leftTracker = numberField(root, "Left tracker id (empty = automatic)");
-        rightTracker = numberField(root, "Right tracker id (empty = automatic)");
+        section(root, "Camera latency");
+        lagAuto = new CheckBox(this);
+        lagAuto.setText("Measure it automatically during fast moves");
+        root.addView(lagAuto);
+        number(root, "camera_lag_ms", "45", false, "Latency (ms): starting value, or fixed when not measured");
 
-        LinearLayout buttons = new LinearLayout(this);
-        buttons.setOrientation(LinearLayout.HORIZONTAL);
-        buttons.setPadding(0, dp(12), 0, dp(12));
-        buttons.addView(button("Save", v -> io.execute(this::saveConfig)));
+        section(root, "Cameras' field of view");
+        number(root, "fov_side_deg", "65", true, "Left / right (deg): beyond this, camera data is ignored");
+        number(root, "fov_up_deg", "45", true, "Up (deg)");
+        number(root, "fov_down_deg", "65", true, "Down (deg)");
+
+        section(root, "Advanced");
+        number(root, "rotation_weight", "1.0", true, "Tracker weight for the orientation (0 to 1)");
+        number(root, "outlier_dist", "0.08", true, "Ignore camera frames farther than this from the tracker (m)");
+        number(root, "assign_max_dist", "0.12", true, "Max tracker to palm distance for assignment (m)");
+        number(root, "min_samples", "120", false, "Frames needed to calibrate a hand");
+        number(root, "learn_rate", "0.01", true, "Calibration refinement rate");
+
+        LinearLayout buttons = row(root);
+        buttons.addView(button("Save", v -> save()));
         buttons.addView(button("Recalibrate", v -> io.execute(this::recalibrate)));
-        buttons.addView(button("Restart PICO Connect", v -> io.execute(this::restartHost)));
-        root.addView(buttons);
+        buttons.addView(button("Defaults", v -> resetAdvanced()));
+        LinearLayout buttons2 = row(root);
+        buttons2.addView(button("Record 60 s", v -> io.execute(this::record)));
+        buttons2.addView(button("Restart PICO Connect", v -> io.execute(this::restartHost)));
 
-        TextView statusTitle = new TextView(this);
-        statusTitle.setText("Live status");
-        statusTitle.setTypeface(Typeface.DEFAULT_BOLD);
-        root.addView(statusTitle);
-
+        section(root, "Live status");
         status = new TextView(this);
         status.setTypeface(Typeface.MONOSPACE);
         status.setText("…");
@@ -170,16 +180,70 @@ public final class MainActivity extends Activity {
         return scroll;
     }
 
-    private EditText numberField(LinearLayout parent, String label) {
+    private interface IntConsumer {
+        void accept(int v);
+    }
+
+    private void showWeight(int v) {
+        weightLabel.setText("Tracker weight when the cameras see the hand: " + v + " %");
+    }
+
+    private void showSmoothing(int v) {
+        smoothingLabel.setText("Tremor smoothing strength: " + v + " %");
+    }
+
+    private SeekBar slider(LinearLayout parent, IntConsumer onChange) {
+        SeekBar s = new SeekBar(this);
+        s.setMax(100);
+        s.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar b, int v, boolean fromUser) {
+                onChange.accept(v);
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar b) {}
+
+            @Override
+            public void onStopTrackingTouch(SeekBar b) {}
+        });
+        parent.addView(s);
+        return s;
+    }
+
+    private void section(LinearLayout parent, String text) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        t.setTextSize(17);
+        t.setPadding(0, dp(16), 0, dp(2));
+        parent.addView(t);
+    }
+
+    private void number(LinearLayout parent, String key, String def, boolean decimal, String label) {
+        NumberSetting n = new NumberSetting(key, def, decimal);
+        n.field = field(parent, label, decimal);
+        numbers.add(n);
+    }
+
+    private EditText field(LinearLayout parent, String label, boolean decimal) {
         TextView l = new TextView(this);
         l.setText(label);
         l.setPadding(0, dp(8), 0, 0);
         parent.addView(l);
         EditText e = new EditText(this);
-        e.setInputType(InputType.TYPE_CLASS_NUMBER);
+        e.setInputType(InputType.TYPE_CLASS_NUMBER | (decimal ? InputType.TYPE_NUMBER_FLAG_DECIMAL : 0));
         e.setSingleLine(true);
         parent.addView(e);
         return e;
+    }
+
+    private LinearLayout row(LinearLayout parent) {
+        LinearLayout r = new LinearLayout(this);
+        r.setOrientation(LinearLayout.HORIZONTAL);
+        r.setPadding(0, dp(8), 0, 0);
+        parent.addView(r);
+        return r;
     }
 
     private Button button(String text, View.OnClickListener l) {
@@ -212,59 +276,56 @@ public final class MainActivity extends Activity {
             if (line.isEmpty() || line.startsWith("#") || eq <= 0) continue;
             conf.put(line.substring(0, eq).trim(), line.substring(eq + 1).trim());
         }
+        final Map<String, String> c = new LinkedHashMap<>(conf);
         ui.post(() -> {
-            enabled.setChecked(!"0".equals(conf.get("enabled")));
-            fullFrequency.setChecked(!"0".equals(conf.get("full_frequency")));
-            int w = Math.round(parseFloat(conf.get("tracked_weight"), 0.9f) * 100f);
+            enabled.setChecked(!"0".equals(c.get("enabled")));
+            fullFrequency.setChecked(!"0".equals(c.get("full_frequency")));
+            lagAuto.setChecked(!"0".equals(c.get("camera_lag_auto")));
+            int w = Math.round(parseFloat(c.get("tracked_weight"), 1.0f) * 100f);
             weight.setProgress(w);
-            weightLabel.setText("Tracker weight when the cameras see the hand: " + w + " %");
-            int s = smoothingFromCutoff(parseFloat(conf.get("finger_min_cutoff"), 1.5f));
+            showWeight(w);
+            int s = smoothingFromCutoff(parseFloat(c.get("finger_min_cutoff"), 1.5f));
             smoothing.setProgress(s);
-            smoothingLabel.setText("Tremor smoothing strength: " + s + " %");
-            hold.setText(orDefault(conf.get("hold_timeout_ms"), "0"));
-            leftTracker.setText(trackerText(conf.get("left_tracker")));
-            rightTracker.setText(trackerText(conf.get("right_tracker")));
+            showSmoothing(s);
+            leftTracker.setText(trackerText(c.get("left_tracker")));
+            rightTracker.setText(trackerText(c.get("right_tracker")));
+            for (NumberSetting n : numbers) n.field.setText(orDefault(c.get(n.key), n.def));
         });
     }
 
-    private void saveConfig() {
-        final String[] values = new String[5];
-        final boolean[] on = new boolean[2];
-        final int[] smooth = new int[1];
-        final Object lock = new Object();
-        ui.post(() -> {
-            synchronized (lock) {
-                on[0] = enabled.isChecked();
-                on[1] = fullFrequency.isChecked();
-                smooth[0] = smoothing.getProgress();
-                values[0] = String.valueOf(weight.getProgress() / 100f);
-                values[1] = orDefault(hold.getText().toString().trim(), "0");
-                values[2] = trackerValue(leftTracker.getText().toString());
-                values[3] = trackerValue(rightTracker.getText().toString());
-                values[4] = "ready";
-                lock.notifyAll();
-            }
-        });
-        synchronized (lock) {
-            while (values[4] == null) {
-                try {
-                    lock.wait();
-                } catch (InterruptedException e) {
-                    return;
-                }
-            }
-        }
-        conf.put("enabled", on[0] ? "1" : "0");
-        conf.put("full_frequency", on[1] ? "1" : "0");
+    /** Reads the form on the UI thread, then writes the file on the io thread. */
+    private void save() {
+        final Map<String, String> values = new LinkedHashMap<>();
+        values.put("enabled", enabled.isChecked() ? "1" : "0");
+        values.put("full_frequency", fullFrequency.isChecked() ? "1" : "0");
+        values.put("camera_lag_auto", lagAuto.isChecked() ? "1" : "0");
+        values.put("tracked_weight", String.valueOf(weight.getProgress() / 100f));
         // One slider drives both filters: stronger smoothing = lower cutoff frequency.
-        float s = smooth[0] / 100f;
-        conf.put("finger_min_cutoff", String.valueOf(4.0f - 3.5f * s));
-        conf.put("wrist_min_cutoff", String.valueOf(8.0f - 6.0f * s));
-        conf.put("tracked_weight", values[0]);
-        conf.put("hold_timeout_ms", values[1]);
-        conf.put("left_tracker", values[2]);
-        conf.put("right_tracker", values[3]);
-        toast(writeConfig() ? "Saved (applied within a second)" : "Could not write the settings");
+        float s = smoothing.getProgress() / 100f;
+        values.put("finger_min_cutoff", String.valueOf(4.0f - 3.5f * s));
+        values.put("wrist_min_cutoff", String.valueOf(8.0f - 6.0f * s));
+        values.put("left_tracker", trackerValue(leftTracker.getText().toString()));
+        values.put("right_tracker", trackerValue(rightTracker.getText().toString()));
+        for (NumberSetting n : numbers) {
+            String v = n.field.getText().toString().trim();
+            if (!isNumber(v, n.decimal)) {
+                toast("Invalid value for " + n.key + ": " + (v.isEmpty() ? "(empty)" : v));
+                return;
+            }
+            values.put(n.key, v);
+        }
+        io.execute(() -> {
+            conf.putAll(values);
+            toast(writeConfig() ? "Saved (applied within a second)" : "Could not write the settings");
+        });
+    }
+
+    private void resetAdvanced() {
+        for (NumberSetting n : numbers) {
+            if (!n.key.equals("hold_timeout_ms")) n.field.setText(n.def);
+        }
+        lagAuto.setChecked(true);
+        toast("Defaults restored in the form: press Save to apply");
     }
 
     private void recalibrate() {
@@ -273,6 +334,14 @@ public final class MainActivity extends Activity {
         // Also re-arm tracker calls the layer disabled after a crash.
         Root.run("rm -f " + DIR + "/hand_fusion_guard_*", null);
         toast(writeConfig() ? "Calibration reset: keep your hands in view for a few seconds"
+                : "Could not write the settings");
+    }
+
+    private void record() {
+        long epoch = parseLong(conf.get("record_epoch"), 0) + 1;
+        conf.put("record_epoch", String.valueOf(epoch));
+        String seconds = orDefault(conf.get("record_seconds"), "60");
+        toast(writeConfig() ? "Recording " + seconds + " s to " + DIR + "/hand_fusion_record.csv"
                 : "Could not write the settings");
     }
 
@@ -302,9 +371,23 @@ public final class MainActivity extends Activity {
         for (String line : raw.split("\n")) {
             int eq = line.indexOf('=');
             if (eq <= 0 || line.startsWith("updated_ns")) continue;
-            sb.append(String.format("%-26s %s%n", line.substring(0, eq), line.substring(eq + 1)));
+            String key = line.substring(0, eq);
+            String value = line.substring(eq + 1);
+            if (key.equals("camera_lag_ms") && value.startsWith("-")) value = "not measured yet";
+            sb.append(String.format("%-26s %s%n", key, value));
         }
         return sb.toString();
+    }
+
+    private static boolean isNumber(String v, boolean decimal) {
+        if (v.isEmpty()) return false;
+        try {
+            if (decimal) Double.parseDouble(v);
+            else Long.parseLong(v);
+            return true;
+        } catch (NumberFormatException e) {
+            return false;
+        }
     }
 
     private static int smoothingFromCutoff(float fingerCutoff) {

@@ -17,14 +17,26 @@ struct Config {
     int64_t holdTimeoutMs = 0;
     // Fingers blend back from the frozen pose to the camera pose over this time (ms).
     int64_t reacquireMs = 150;
+    // Hand out of the cameras' view: after this delay, the fingers relax from the last pose seen toward the
+    // average pose of this hand over this time (ms, finger_relax_ms 0 = keep the last pose).
+    int64_t fingerRelaxDelayMs = 300;
+    int64_t fingerRelaxMs = 1500;
     // Slow learning rate of the tracker -> palm offset once it is established.
     float learnRate = 0.01f;
     // Camera hand latency relative to the tracker; learning compares the camera with the tracker this long ago.
+    // With camera_lag_auto, it is measured during fast moves and this value is only the starting point.
     int64_t cameraLagMs = 45;
+    bool cameraLagAuto = true;
     // Samples needed before the offset is trusted.
     int minSamples = 120;
     // Max distance between a tracker and the palm for automatic assignment (m).
     float assignMaxDist = 0.12f;
+    // Hand tracking cameras' field of view around the headset's forward axis (deg). Camera data for a
+    // hand whose tracker puts it outside is ignored: the runtime keeps sending a stale hand there.
+    bool fovCheck = true;
+    float fovSideDeg = 65.f;
+    float fovUpDeg = 45.f;
+    float fovDownDeg = 65.f;
     // Manual tracker ids (-1 = automatic assignment).
     int64_t leftTracker = -1;
     int64_t rightTracker = -1;
@@ -58,6 +70,8 @@ private:
     Config cfg_;
     int64_t lastCheckNs_ = 0;
     int64_t lastMtime_ = -1;
+    int64_t lastSize_ = -1;
+    uint64_t lastInode_ = 0;
 };
 
 }  // namespace hf

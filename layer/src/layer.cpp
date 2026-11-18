@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -25,6 +26,7 @@
 #include "log.h"
 #include "plthook.h"
 #include "recorder.h"
+#include "xr_math.h"
 
 #define HF_EXPORT extern "C" __attribute__((visibility("default")))
 
@@ -75,6 +77,9 @@ struct State {
     PFN_xrLocateHandJointsEXT nextLocateHandJoints = nullptr;
     PFN_xrLocateMotionTrackerPICO locateMotionTracker = nullptr;
     PFN_xrRequestMotionTrackerDevicePICO requestMotionTracker = nullptr;
+    PFN_xrCreateReferenceSpace createReferenceSpace = nullptr;
+    PFN_xrLocateSpace locateSpace = nullptr;
+    PFN_xrDestroySpace destroySpace = nullptr;
 
     std::map<XrHandTrackerEXT, int> handOf;
 
@@ -89,6 +94,9 @@ struct State {
     XrTime lastHandTime = 0, prevHandTime = 0;
     TrackerSample workerOut[Fusion::kMaxTrackers];
     int workerCount = 0;
+    XrSpace viewSpace = XR_NULL_HANDLE;  // created and used by the worker only
+    XrPosef workerView{};                // headset pose in the hand space, for the field of view check
+    bool workerViewValid = false;
     bool workerStarted = false;
     bool workerLocateDone = false;
     // Timing (reset at each status write).
@@ -103,6 +111,8 @@ struct State {
     // Snapshot of the worker's latest tracker poses, taken by the hand tracking hook.
     TrackerSample cache[Fusion::kMaxTrackers];
     int cacheCount = 0;
+    XrPosef cacheView{};
+    bool cacheViewValid = false;
 
     ConfigStore config;
     Recorder recorder;
@@ -112,6 +122,7 @@ struct State {
     uint64_t statusWrites = 0;
     XrPosef savedOffset[2]{};
     bool haveSaved[2] = {false, false};
+    float savedLagMs = -1.f;  // measured camera latency last written to the offsets file
     int64_t lastOffsetSaveNs = 0;
     uint64_t locateCalls = 0;
 };
@@ -242,6 +253,24 @@ void* trackerWorker(void*) {
                 // Without the TRACKED bit the runtime only dead-reckons the position (tracker hidden).
                 t.positionTracked = (flags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) != 0;
             }
+            // Headset pose for the same time, in the same space (for the field of view check).
+            if (s.viewSpace == XR_NULL_HANDLE && s.createReferenceSpace) {
+                XrReferenceSpaceCreateInfo ci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+                ci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+                ci.poseInReferenceSpace = pidentity();
+                if (XR_FAILED(s.createReferenceSpace(session, &ci, &s.viewSpace))) s.viewSpace = XR_NULL_HANDLE;
+            }
+            XrPosef view{};
+            bool viewValid = false;
+            if (s.viewSpace != XR_NULL_HANDLE && s.locateSpace) {
+                XrSpaceLocation vl{XR_TYPE_SPACE_LOCATION};
+                const XrSpaceLocationFlags need =
+                    XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+                if (XR_SUCCEEDED(s.locateSpace(s.viewSpace, space, target, &vl)) && (vl.locationFlags & need) == need) {
+                    view = vl.pose;
+                    viewValid = true;
+                }
+            }
             const int64_t dt = nowNs() - t0;
             if (!s.workerLocateDone) {
                 guardEnd(s, "locate");
@@ -251,6 +280,8 @@ void* trackerWorker(void*) {
             std::lock_guard<std::mutex> lk(s.trk);
             for (int i = 0; i < count; i++) s.workerOut[i] = out[i];
             s.workerCount = count;
+            s.workerView = view;
+            s.workerViewValid = viewValid;
             s.trkNsSum += dt;
             s.trkCount++;
             if (dt > s.trkNsMax) s.trkNsMax = dt;
@@ -273,6 +304,9 @@ void startTrackerWorker(State& s) {
 void detachWorker(State& s) {
     std::lock_guard<std::mutex> busy(s.workerBusy);
     std::lock_guard<std::mutex> lk(s.trk);
+    if (s.viewSpace != XR_NULL_HANDLE && s.destroySpace) s.destroySpace(s.viewSpace);
+    s.viewSpace = XR_NULL_HANDLE;
+    s.workerViewValid = false;
     s.workerSession = XR_NULL_HANDLE;
     s.workerSpace = XR_NULL_HANDLE;
     s.workerCount = 0;
@@ -289,6 +323,8 @@ void refreshTrackers(State& s, XrSpace space, XrTime time) {
     }
     s.cacheCount = s.workerCount;
     for (int i = 0; i < s.workerCount; i++) s.cache[i] = s.workerOut[i];
+    s.cacheView = s.workerView;
+    s.cacheViewValid = s.workerViewValid;
 }
 
 // ---------------------------------------------------------------- offset persistence
@@ -304,6 +340,11 @@ void loadOffsets(State& s) {
     int loaded = 0;
     while (fscanf(f, "%15s %f %f %f %f %f %f %f", side, &p.position.x, &p.position.y, &p.position.z,
                   &p.orientation.x, &p.orientation.y, &p.orientation.z, &p.orientation.w) == 8) {
+        if (!strcmp(side, "lag")) {  // measured camera latency (ms), padded to the same 8 fields
+            s.fusion.seedCameraLag(p.position.x);
+            s.savedLagMs = p.position.x;
+            continue;
+        }
         const int hand = !strcmp(side, "left") ? 0 : !strcmp(side, "right") ? 1 : -1;
         if (hand >= 0) {
             s.fusion.seedOffset(hand, p);
@@ -327,6 +368,11 @@ void saveOffsets(State& s, int64_t now, bool force) {
         s.savedOffset[hand] = p;
         s.haveSaved[hand] = true;
     }
+    const float lag = s.fusion.measuredLagMs();
+    if (lag > 0.f && std::fabs(lag - s.savedLagMs) >= 1.f) {
+        s.savedLagMs = lag;
+        changed = true;
+    }
     if (!changed) return;
     const std::string path = offsetsPath(s), tmp = path + ".tmp";
     FILE* f = fopen(tmp.c_str(), "w");
@@ -337,6 +383,7 @@ void saveOffsets(State& s, int64_t now, bool force) {
         fprintf(f, "%s %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n", hand ? "right" : "left", p.position.x, p.position.y,
                 p.position.z, p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w);
     }
+    if (s.savedLagMs > 0.f) fprintf(f, "lag %.1f 0 0 0 0 0 0\n", s.savedLagMs);
     fclose(f);
     rename(tmp.c_str(), path.c_str());
 }
@@ -344,6 +391,7 @@ void saveOffsets(State& s, int64_t now, bool force) {
 void forgetOffsets(State& s) {
     unlink(offsetsPath(s).c_str());
     s.haveSaved[0] = s.haveSaved[1] = false;
+    s.savedLagMs = -1.f;
     HF_LOGI("offsets: forgotten (recalibration requested)");
 }
 
@@ -352,7 +400,7 @@ void writeStatus(State& s, int64_t now) {
     s.lastStatusNs = now;
     std::string out;
     char buf[128];
-    snprintf(buf, sizeof(buf), "layer_version=2\nenabled=%d\nmotion_ext=%d\nlocate_calls=%llu\nusing_trackers=%d\n",
+    snprintf(buf, sizeof(buf), "layer_version=3\nenabled=%d\nmotion_ext=%d\nlocate_calls=%llu\nusing_trackers=%d\n",
              s.config.get().enabled ? 1 : 0, s.motionExtEnabled ? 1 : 0, (unsigned long long)s.locateCalls,
              s.fusion.usingTrackers() ? 1 : 0);
     out += buf;
@@ -519,6 +567,7 @@ XrResult XRAPI_CALL hook_xrLocateHandJointsEXT(XrHandTrackerEXT tracker, const X
             s.epoch = c.calibEpoch;
             s.fusion.reset();
             forgetOffsets(s);
+            s.fusion.resetCameraLag();
         }
         s.recorder.arm(c.recordEpoch, c.recordSeconds, now);
     }
@@ -550,8 +599,11 @@ XrResult XRAPI_CALL hook_xrLocateHandJointsEXT(XrHandTrackerEXT tracker, const X
         s.recorder.captureInput(it->second, info->time, locations, t != nullptr, t ? t->id : 0, t && t->valid,
                                 t ? t->pose : XrPosef{}, t ? (uint32_t)t->flags : 0);
     }
-    s.fusion.process(it->second, info->time, s.cache, s.cacheCount, locations, cfg);
-    if (s.recorder.active()) s.recorder.captureOutput(it->second, locations, s.fusion.mode(it->second));
+    s.fusion.process(it->second, info->time, s.cache, s.cacheCount, locations, cfg,
+                     s.cacheViewValid ? &s.cacheView : nullptr);
+    if (s.recorder.active()) s.recorder.captureOutput(it->second, locations, s.fusion.mode(it->second),
+                                                     s.fusion.shapeDelta(it->second), s.fusion.viewAzimuth(it->second),
+                                                     s.fusion.viewElevation(it->second));
     s.recorder.finishIfDue(now, s.dataDir);
     saveOffsets(s, now, false);
     writeStatus(s, now);
@@ -652,6 +704,9 @@ XrResult createInstanceCommon(const XrInstanceCreateInfo* info, XrInstance* inst
     if (s.motionExtEnabled) {
         resolve(s, *instance, "xrLocateMotionTrackerPICO", &s.locateMotionTracker);
         resolve(s, *instance, "xrRequestMotionTrackerDevicePICO", &s.requestMotionTracker);
+        resolve(s, *instance, "xrCreateReferenceSpace", &s.createReferenceSpace);
+        resolve(s, *instance, "xrLocateSpace", &s.locateSpace);
+        resolve(s, *instance, "xrDestroySpace", &s.destroySpace);
     }
     HF_LOGI("instance created, motion tracking %s", s.locateMotionTracker ? "available" : "unavailable");
     return r;

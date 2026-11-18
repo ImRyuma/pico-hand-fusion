@@ -31,11 +31,12 @@ Nothing changes on the PC side.
 ### The fusion, per hand
 
 1. **Assignment**: the tracker closest to the palm (under 12 cm) for about half a second is locked to that hand.
-2. **Calibration**: the palm pose in the tracker frame is learned from camera frames (the tracker is rigid with the palm). The camera lags the tracker by ~45 ms, so camera frames are compared with the tracker pose from that long ago. The offset is remembered across sessions; a lasting disagreement relearns it in the background.
-3. **Tracker seen by the headset**: the hand position and orientation come from the tracker (~2 mm jitter); the cameras only provide the finger shape, smoothed by One Euro filters.
-4. **Tracker hidden** (palm facing the headset): the tracker IMU keeps the orientation; the position follows the tracker's dead-reckoned motion, pulled toward the camera by a complementary filter. Runtime re-snaps are ignored.
-5. **Camera lost or frozen** (the runtime keeps returning a frozen pose flagged as tracked): the hand follows its tracker with the last finger shape.
-6. **Full frequency**: a root daemon keeps the trackers at full frequency while a hand is driven by a tracker.
+2. **Calibration**: the palm pose in the tracker frame is learned from camera frames (the tracker is rigid with the palm). The camera lags the tracker, so camera frames are compared with the tracker pose from that long ago. The offset is remembered across sessions; a lasting disagreement relearns it in the background.
+3. **Camera latency**: measured during fast moves (the delay that best lines the camera palm up with the tracker), smoothed across measurements and remembered across sessions. 45 ms is only the starting value.
+4. **Tracker seen by the headset**: the hand position and orientation come from the tracker (~2 mm jitter); the cameras only provide the finger shape, smoothed by One Euro filters.
+5. **Tracker hidden** (palm facing the headset): the tracker IMU keeps the orientation; the position follows the tracker's dead-reckoned motion, pulled toward the camera by a complementary filter. Runtime re-snaps are ignored.
+6. **Camera lost, frozen or out of view**: out of the cameras' view, the runtime keeps sending a stale hand flagged as tracked (frozen, or still moving). The tracker tells where the hand really is: when that is outside the cameras' field of view (or the skeleton only moves as one rigid block, or stops changing), the camera data is ignored and the hand follows its tracker. The fingers start from the last shape seen, then relax toward this hand's usual pose (a slow average of what the cameras saw), instead of staying frozen mid-gesture.
+7. **Full frequency**: a root daemon keeps the trackers at full frequency while a hand is driven by a tracker.
 
 ## Contents
 
@@ -87,7 +88,12 @@ Then:
 | `full_frequency` | `1` | Keep trackers at full frequency during sessions |
 | `tracked_weight` / `rotation_weight` | `1.0` / `1.0` | Tracker weight for position / orientation when the cameras see the hand |
 | `outlier_dist` | `0.08` | Camera palm farther than this from the tracker is rejected (m) |
-| `camera_lag_ms` | `45` | Camera latency relative to the tracker |
+| `camera_lag_auto` | `1` | Measure the camera latency automatically |
+| `camera_lag_ms` | `45` | Camera latency relative to the tracker (starting value, or fixed when `camera_lag_auto=0`) |
+| `finger_relax_delay_ms` / `finger_relax_ms` | `300` / `1500` | Out of view, fingers relax toward the usual pose after this delay, over this time (`finger_relax_ms=0` keeps the last pose) |
+| `reacquire_ms` | `150` | Fingers blend back to the cameras over this time |
+| `fov_check` | `1` | Ignore camera data for a hand that its tracker puts outside the cameras' field of view |
+| `fov_side_deg` / `fov_up_deg` / `fov_down_deg` | `65` / `45` / `65` | That field of view, around the headset's forward axis |
 | `wrist_min_cutoff` / `wrist_beta` | `4.0` / `1.0` | One Euro filter of the palm pose |
 | `finger_min_cutoff` / `finger_beta` | `1.5` / `0.4` | One Euro filter of the fingers |
 | `hold_timeout_ms` | `0` | How long a hand lost by the cameras follows its tracker (`0` = forever) |
@@ -97,15 +103,18 @@ Then:
 | `calib_epoch` | `0` | Changing it forgets every learned offset |
 | `record_epoch` / `record_seconds` | `0` / `60` | Changing `record_epoch` records raw data to `hand_fusion_record.csv` |
 
-Live state: `hand_fusion_status.txt` in the same folder, or `adb logcat -s HandFusion`. Tuning session: `tools/record.sh 60 out.csv`, then `python tools/analyze_record.py out.csv`.
+The companion app exposes all of them, plus Recalibrate, Record 60 s and Restart PICO Connect.
+
+Live state (including the measured `camera_lag_ms`): `hand_fusion_status.txt` in the same folder, or `adb logcat -s HandFusion`. Tuning session: `tools/record.sh 60 out.csv`, then `python tools/analyze_record.py out.csv`.
 
 ## Known limitations
 
 - Not stable yet: tested on one headset and one firmware; a PICO Connect update can break the hooks.
+- The automatic camera latency measurement is new and not validated against a reference yet: if hands feel off after a few sessions, press Recalibrate (it also clears the measurement) or set `camera_lag_auto=0`.
+- The field of view limits are estimates: tune `fov_side_deg` / `fov_up_deg` / `fov_down_deg` if a hand you can see is ignored, or a stale hand still shows at the edges.
 - The trackers on the back of the hands are often hidden from the headset (30-70 % of the time in tests).
-- When a hand is out of view, fingers stay frozen in the last pose the cameras saw.
+- When a hand is out of view, the fingers can only relax toward an average pose: the actual gesture is unknown.
 - Trackers in Object tracking mode are no longer available for full body tracking; full frequency uses more tracker battery.
-- The companion app does not expose every setting yet.
 
 ## Uninstall
 

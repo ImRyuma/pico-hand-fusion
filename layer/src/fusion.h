@@ -34,19 +34,30 @@ public:
 
     void reset();
     // Called after the runtime has filled `locs` for `hand` (0 = left, 1 = right).
+    // `view` is the headset pose in the same space as the hand (nullptr if unknown).
     void process(int hand, XrTime time, const TrackerSample* trackers, int trackerCount,
-                 XrHandJointLocationsEXT* locs, const Config& cfg);
+                 XrHandJointLocationsEXT* locs, const Config& cfg, const XrPosef* view = nullptr);
     std::string status() const;
     int64_t assigned(int hand) const { return hands_[hand].assigned; }
     // True while at least one hand has a tracker (used to hold full frequency).
     bool usingTrackers() const;
     int mode(int hand) const { return (int)hands_[hand].mode; }
+    // Largest finger joint move in the palm frame since the previous fresh camera frame (m), for the recorder.
+    float shapeDelta(int hand) const { return hands_[hand].shapeDelta; }
+    // Direction of the hand seen from the headset (deg, right and up positive), for the recorder.
+    float viewAzimuth(int hand) const { return hands_[hand].viewAz; }
+    float viewElevation(int hand) const { return hands_[hand].viewEl; }
     // Offset persistence across sessions (palm pose in the tracker frame, per hand).
     void seedOffset(int hand, const XrPosef& offset);
     bool learnedOffset(int hand, XrPosef* out) const;
+    // Measured camera latency (ms, < 0 = not measured yet), persisted with the offsets.
+    float measuredLagMs() const { return lagEstMs_; }
+    void seedCameraLag(float ms);
+    void resetCameraLag() { lagEstMs_ = -1.f; lagUpdates_ = 0; lagRmsMm_ = 0.f; }
 
 private:
-    static constexpr int kHistory = 64;  // tracker poses kept for camera lag compensation (~0.7 s)
+    static constexpr int kHistory = 192;  // tracker poses kept for camera lag compensation and measurement (~2 s)
+    static constexpr int kLagWindow = 40; // fresh camera frames per camera latency measurement
 
     struct Hand {
         // Tracker assignment.
@@ -78,7 +89,10 @@ private:
         // Finger shape: joints in the palm frame.
         bool haveShape = false;
         XrPosef shape[kJointCount]{};
-        XrPosef frozen[kJointCount]{};
+        XrPosef frozen[kJointCount]{};     // output shape when the cameras found the hand again
+        XrPosef lostShape[kJointCount]{};  // shape when the cameras lost the hand
+        bool haveMean = false;
+        XrPosef meanShape[kJointCount]{};  // slow average of the shapes seen: relaxed pose out of view
         float radius[kJointCount]{};
         XrTime lastGood = 0;
         XrTime reacquireStart = 0;
@@ -104,9 +118,23 @@ private:
         uint64_t trackerHidden = 0; // frames without optical tracking of the tracker
         uint64_t jumps = 0;
         uint64_t cameraFrozenFrames = 0;
+        // Camera latency measurement: fresh camera palm positions during moves.
+        XrTime lagTime[kLagWindow]{};
+        XrVector3f lagCam[kLagWindow]{};
+        int lagCount = 0;
         // Frozen camera detection.
         XrVector3f lastCamPos{};
         int camRepeat = 0;
+        // Extrapolated camera detection: the runtime moves the last skeleton seen as one rigid block.
+        XrVector3f prevLocal[kJointCount]{};
+        bool havePrevLocal = false;
+        XrVector3f prevCamPalm{};
+        int rigidRepeat = 0;
+        float shapeDelta = 0.f;
+        uint64_t cameraExtrapolatedFrames = 0;
+        // Field of view check.
+        float viewAz = 0.f, viewEl = 0.f;
+        uint64_t outOfViewFrames = 0;
     };
 
     void assign(int hand, const XrVector3f& palm, const TrackerSample* trackers, int n, const Config& cfg);
@@ -117,8 +145,13 @@ private:
     void resetFilters(Hand& h);
     void unassign(Hand& h);
     void applySeed(Hand& h, int hand, const Config& cfg);
+    void measureLag(Hand& h, XrTime time, const XrVector3f& camPalm);
+    int64_t lagNs(const Config& cfg) const;
 
     Hand hands_[2];
+    float lagEstMs_ = -1.f;
+    int lagUpdates_ = 0;
+    float lagRmsMm_ = 0.f;
 };
 
 }  // namespace hf

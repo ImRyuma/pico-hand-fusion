@@ -1,6 +1,6 @@
 id=pico_hand_fusion
 name=Pico Hand Fusion
-version=v0.2.8
-versionCode=10
+version=v0.3.0
+versionCode=11
 author=ImRyuma
 description=Fuses Pico Motion Trackers worn on the back of the hands with camera hand tracking in PICO Connect (OpenXR API layer, full-frequency hold)
